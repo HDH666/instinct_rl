@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 
 
@@ -77,6 +78,22 @@ class EmpiricalNormalization(nn.Module):
     def inverse(self, y):
         return y * (self._std + self.eps) + self._mean
 
+    def init_broadcast(self):
+        """Broadcast buffers from rank 0 so all processes start from the same statistics."""
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+        for buffer in self.buffers():
+            dist.broadcast(buffer, src=0)
+
+    def sync_across_processes(self):
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+        dist.all_reduce(self._mean, op=dist.ReduceOp.SUM)
+        self._mean /= dist.get_world_size()
+        dist.all_reduce(self._var, op=dist.ReduceOp.SUM)
+        self._var /= dist.get_world_size()
+        self._std = torch.sqrt(self._var)
+
     def export(self, path):
         np.savez(
             path,
@@ -113,6 +130,12 @@ class EmpiricalDiscountedVariationNormalization(nn.Module):
             return rew / self.emp_norm._std
         else:
             return rew
+
+    def init_broadcast(self):
+        self.emp_norm.init_broadcast()
+
+    def sync_across_processes(self):
+        self.emp_norm.sync_across_processes()
 
 
 class DiscountedAverage:

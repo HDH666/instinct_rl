@@ -88,6 +88,13 @@ class WasabiAlgoMixin:
             num_envs, num_transitions_per_env, [actor_state_size], [reference_state_size], device=self.device
         )
 
+    def distributed_data_parallel(self):
+        super().distributed_data_parallel()
+        for param in self.discriminator.parameters():
+            dist.broadcast(param.data, src=0)
+        if self.discriminator.normalizer is not None:
+            self.discriminator.normalizer.init_broadcast()
+
     def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
         if not (self.actor_state_key in infos["observations"] and self.reference_state_key in infos["observations"]):
             raise ValueError(
@@ -150,6 +157,8 @@ class WasabiAlgoMixin:
 
             self.wasabi_gradient_step(loss, average_stats)
 
+        if self.discriminator.normalizer is not None:
+            self.discriminator.normalizer.sync_across_processes()
         self.amp_storage.clear()
 
         return mean_losses, average_stats
