@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 
 
@@ -77,6 +78,49 @@ class EmpiricalNormalization(nn.Module):
     def inverse(self, y):
         return y * (self._std + self.eps) + self._mean
 
+    def init_broadcast(self):
+        """Broadcast buffers from rank 0 so all processes start from the same statistics."""
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+        for buffer in self.buffers():
+            dist.broadcast(buffer, src=0)
+
+    def sync_across_processes(self):
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+
+        world_size = dist.get_world_size()
+        device = self._mean.device
+
+        local_mean = self._mean.squeeze(0)
+        local_var = self._var.squeeze(0)
+        local_count = self.count.float()
+
+        all_means = [torch.zeros_like(local_mean) for _ in range(world_size)]
+        dist.all_gather(all_means, local_mean)
+
+        all_vars = [torch.zeros_like(local_var) for _ in range(world_size)]
+        dist.all_gather(all_vars, local_var)
+
+        all_counts = [torch.zeros(1, device=device) for _ in range(world_size)]
+        dist.all_gather(all_counts, local_count.unsqueeze(0))
+        all_counts = [c.squeeze() for c in all_counts]
+
+        total_count = sum(all_counts)
+        if total_count == 0:
+            return
+
+        global_mean = sum(m * c for m, c in zip(all_means, all_counts)) / total_count
+        global_var = sum(
+            c * (v + (m - global_mean) ** 2)
+            for m, v, c in zip(all_means, all_vars, all_counts)
+        ) / total_count
+
+        self._mean = global_mean.unsqueeze(0)
+        self._var = global_var.unsqueeze(0)
+        self._std = torch.sqrt(self._var)
+        self.count = total_count.long()
+
     def export(self, path):
         np.savez(
             path,
@@ -113,6 +157,12 @@ class EmpiricalDiscountedVariationNormalization(nn.Module):
             return rew / self.emp_norm._std
         else:
             return rew
+
+    def init_broadcast(self):
+        self.emp_norm.init_broadcast()
+
+    def sync_across_processes(self):
+        self.emp_norm.sync_across_processes()
 
 
 class DiscountedAverage:

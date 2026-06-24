@@ -113,6 +113,8 @@ class OnPolicyRunner:
         # load from a checkpoint trained in non-DDP mode.
         if dist.is_initialized():
             self.alg.distributed_data_parallel()
+            for normalizer in self.normalizers.values():
+                normalizer.init_broadcast()
             print(f"[INFO rank {dist.get_rank()}]: DistributedDataParallel enabled.")
         # initialize writer
         if self.log_dir is not None and self.writer is None and (not self.is_mp_rank_other_process()):
@@ -176,6 +178,10 @@ class OnPolicyRunner:
 
                 stop = time.time()
                 collection_time = stop - start
+
+                # Sync normalizer running statistics across processes after rollout
+                for normalizer in self.normalizers.values():
+                    normalizer.sync_across_processes()
 
                 # Learning step
                 start = stop
