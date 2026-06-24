@@ -88,11 +88,38 @@ class EmpiricalNormalization(nn.Module):
     def sync_across_processes(self):
         if not dist.is_initialized() or dist.get_world_size() == 1:
             return
-        dist.all_reduce(self._mean, op=dist.ReduceOp.SUM)
-        self._mean /= dist.get_world_size()
-        dist.all_reduce(self._var, op=dist.ReduceOp.SUM)
-        self._var /= dist.get_world_size()
+
+        world_size = dist.get_world_size()
+        device = self._mean.device
+
+        local_mean = self._mean.squeeze(0)
+        local_var = self._var.squeeze(0)
+        local_count = self.count.float()
+
+        all_means = [torch.zeros_like(local_mean) for _ in range(world_size)]
+        dist.all_gather(all_means, local_mean)
+
+        all_vars = [torch.zeros_like(local_var) for _ in range(world_size)]
+        dist.all_gather(all_vars, local_var)
+
+        all_counts = [torch.zeros(1, device=device) for _ in range(world_size)]
+        dist.all_gather(all_counts, local_count.unsqueeze(0))
+        all_counts = [c.squeeze() for c in all_counts]
+
+        total_count = sum(all_counts)
+        if total_count == 0:
+            return
+
+        global_mean = sum(m * c for m, c in zip(all_means, all_counts)) / total_count
+        global_var = sum(
+            c * (v + (m - global_mean) ** 2)
+            for m, v, c in zip(all_means, all_vars, all_counts)
+        ) / total_count
+
+        self._mean = global_mean.unsqueeze(0)
+        self._var = global_var.unsqueeze(0)
         self._std = torch.sqrt(self._var)
+        self.count = total_count.long()
 
     def export(self, path):
         np.savez(
