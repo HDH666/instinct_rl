@@ -31,7 +31,7 @@
 import os
 import pathlib
 from collections import OrderedDict
-from typing import List
+from typing import List, Union
 
 import git
 import numpy as np
@@ -182,21 +182,29 @@ def get_subobs_by_components(observations, component_names, obs_segments: Ordere
     return torch.cat(subobs, dim=-1) if cat else subobs
 
 
-def get_subobs_indexing_by_components(obs_segments: OrderedDict, component_names: List[str]) -> torch.Tensor:
-    """Get the indexing of the subobs by the component names, which may be used by torch.gather with the index array to
-    extract the subobs.
+def get_subobs_indexing_by_components(
+    obs_segments: OrderedDict, component_names: List[str], cat=True, temporal=False
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    """Get the indexing of the subobs by the component names, which may be used to extract the subobs
+    via `observations[..., indices]`.
     Args:
         obs_segments: The observation segments.
         component_names: The component names to extract.
+        cat: If True, concatenate the index arrays into one tensor. If False, return a list of per-component tensors.
+        temporal: If True, reshape each component's indices to (time, feat_per_step) matching obs_shape.
     Returns:
-        The indexing of the subobs as a tensor of shape (subobs_size,).
+        A tensor of shape (subobs_size,) when cat=True and temporal=False, or (time, total_feat) when cat=True
+        and temporal=True. A list of per-component index tensors when cat=False.
     """
     index_arrays = []
     for component in obs_segments.keys():
         if component in component_names:
             obs_slice, obs_shape = get_obs_slice(obs_segments, component)
-            index_arrays.append(torch.arange(obs_slice.start, obs_slice.stop))
-    return torch.cat(index_arrays)
+            indices = torch.arange(obs_slice.start, obs_slice.stop)
+            if temporal:
+                indices = indices.reshape(obs_shape[0], -1)
+            index_arrays.append(indices)
+    return torch.cat(index_arrays, dim=-1) if cat else index_arrays
 
 
 def replace_obs_components(
