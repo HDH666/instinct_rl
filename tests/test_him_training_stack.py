@@ -1,5 +1,6 @@
 from collections import OrderedDict
 
+import pytest
 import torch
 
 from instinct_rl.env import VecEnv
@@ -108,6 +109,17 @@ def _any_param_changed(before, module):
     return any(not torch.allclose(old, new.detach()) for old, new in zip(before, module.parameters()))
 
 
+def _source_him_checkpoint_from_runner(runner):
+    source_state_dict = runner.alg.state_dict()
+    model_state_dict = OrderedDict()
+    for index, (key, value) in enumerate(source_state_dict["model_state_dict"].items()):
+        model_state_dict[key] = torch.full_like(value, fill_value=(index + 1) / 100.0)
+    source_state_dict["model_state_dict"] = model_state_dict
+    source_state_dict["iter"] = 17
+    source_state_dict["infos"] = {"source": "him_parkour"}
+    return source_state_dict
+
+
 def test_him_runner_rollout_update_and_checkpoint(tmp_path):
     torch.manual_seed(7)
     env = MockHIMVecEnv()
@@ -149,3 +161,64 @@ def test_him_runner_rollout_update_and_checkpoint(tmp_path):
     loaded_runner.load(checkpoint_path)
     for saved, loaded in zip(runner.alg.actor_critic.parameters(), loaded_runner.alg.actor_critic.parameters()):
         assert torch.allclose(saved, loaded)
+
+
+def test_him_source_checkpoint_adapter_loads_exact_model_weights(tmp_path):
+    torch.manual_seed(11)
+    source_runner = OnPolicyRunner(MockHIMVecEnv(), _him_train_cfg(), log_dir=None, device="cpu")
+    source_checkpoint = _source_him_checkpoint_from_runner(source_runner)
+    source_checkpoint_path = tmp_path / "source_him_model.pt"
+    torch.save(source_checkpoint, source_checkpoint_path)
+
+    cfg = _him_train_cfg()
+    cfg["ckpt_manipulator"] = "strict_him_source_checkpoint"
+    loaded_runner = OnPolicyRunner(MockHIMVecEnv(), cfg, log_dir=None, device="cpu")
+    infos = loaded_runner.load(source_checkpoint_path)
+
+    assert infos == {"source": "him_parkour"}
+    assert loaded_runner.current_learning_iteration == 17
+    loaded_model_state_dict = loaded_runner.alg.actor_critic.state_dict()
+    for key, source_weight in source_checkpoint["model_state_dict"].items():
+        assert torch.equal(loaded_model_state_dict[key], source_weight)
+
+
+@pytest.mark.parametrize(
+    ("mutate_checkpoint", "match"),
+    [
+        (
+            lambda checkpoint: checkpoint["model_state_dict"].pop(next(iter(checkpoint["model_state_dict"]))),
+            "missing model weights",
+        ),
+        (
+            lambda checkpoint: checkpoint["model_state_dict"].__setitem__(
+                "unexpected.weight",
+                torch.zeros(1),
+            ),
+            "extra model weights",
+        ),
+        (
+            lambda checkpoint: checkpoint["model_state_dict"].__setitem__(
+                next(iter(checkpoint["model_state_dict"])),
+                torch.zeros(1),
+            ),
+            "shape mismatches",
+        ),
+        (
+            lambda checkpoint: checkpoint.pop("estimator_optimizer_state_dict"),
+            "estimator_optimizer_state_dict",
+        ),
+    ],
+)
+def test_him_source_checkpoint_adapter_fails_explicitly(tmp_path, mutate_checkpoint, match):
+    source_runner = OnPolicyRunner(MockHIMVecEnv(), _him_train_cfg(), log_dir=None, device="cpu")
+    source_checkpoint = _source_him_checkpoint_from_runner(source_runner)
+    mutate_checkpoint(source_checkpoint)
+    source_checkpoint_path = tmp_path / "bad_source_him_model.pt"
+    torch.save(source_checkpoint, source_checkpoint_path)
+
+    cfg = _him_train_cfg()
+    cfg["ckpt_manipulator"] = "strict_him_source_checkpoint"
+    loaded_runner = OnPolicyRunner(MockHIMVecEnv(), cfg, log_dir=None, device="cpu")
+
+    with pytest.raises(ValueError, match=match):
+        loaded_runner.load(source_checkpoint_path)

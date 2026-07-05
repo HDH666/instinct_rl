@@ -17,6 +17,78 @@ import regex as re
 import torch
 
 
+def strict_him_source_checkpoint(source_state_dict: dict, algo_state_dict: dict):
+    """Adapt a source HIM checkpoint only when model weights match exactly.
+
+    This is intended for checkpoints saved by ``him_parkour``'s
+    ``HIMOnPolicyRunner``. It allows top-level metadata to pass through, but
+    model weights must match the target HIM model by key and tensor shape.
+    """
+    _require_top_level_key(source_state_dict, "model_state_dict")
+    _require_top_level_key(source_state_dict, "iter")
+    _require_top_level_key(source_state_dict, "infos")
+    _require_top_level_key(algo_state_dict, "model_state_dict")
+
+    if "optimizer_state_dict" in algo_state_dict:
+        _require_optimizer_state_dict(source_state_dict, "optimizer_state_dict")
+    if "estimator_optimizer_state_dict" in algo_state_dict:
+        _require_optimizer_state_dict(source_state_dict, "estimator_optimizer_state_dict")
+
+    source_model_state_dict = source_state_dict["model_state_dict"]
+    target_model_state_dict = algo_state_dict["model_state_dict"]
+    _validate_matching_model_state_dict(source_model_state_dict, target_model_state_dict)
+
+    adapted_state_dict = OrderedDict()
+    for key, value in source_state_dict.items():
+        if key == "model_state_dict":
+            adapted_state_dict[key] = OrderedDict(
+                (model_key, source_model_state_dict[model_key]) for model_key in target_model_state_dict.keys()
+            )
+        else:
+            adapted_state_dict[key] = value
+    return adapted_state_dict
+
+
+def _require_top_level_key(state_dict: dict, key: str):
+    if key not in state_dict:
+        raise ValueError(f"Source HIM checkpoint is missing required top-level key: {key}")
+
+
+def _require_optimizer_state_dict(state_dict: dict, key: str):
+    _require_top_level_key(state_dict, key)
+    optimizer_state_dict = state_dict[key]
+    if not isinstance(optimizer_state_dict, dict):
+        raise ValueError(f"Source HIM checkpoint {key} must be a dict.")
+    missing_keys = {"state", "param_groups"} - set(optimizer_state_dict.keys())
+    if missing_keys:
+        raise ValueError(f"Source HIM checkpoint {key} is missing optimizer metadata keys: {sorted(missing_keys)}")
+
+
+def _validate_matching_model_state_dict(source_model_state_dict: dict, target_model_state_dict: dict):
+    source_keys = set(source_model_state_dict.keys())
+    target_keys = set(target_model_state_dict.keys())
+    missing_keys = sorted(target_keys - source_keys)
+    extra_keys = sorted(source_keys - target_keys)
+    if missing_keys or extra_keys:
+        message_parts = ["Source HIM checkpoint model_state_dict does not match target HIM model."]
+        if missing_keys:
+            message_parts.append(f"missing model weights: {missing_keys}")
+        if extra_keys:
+            message_parts.append(f"extra model weights: {extra_keys}")
+        raise ValueError(" ".join(message_parts))
+
+    shape_mismatches = []
+    for key in target_model_state_dict.keys():
+        source_tensor = source_model_state_dict[key]
+        target_tensor = target_model_state_dict[key]
+        if not isinstance(source_tensor, torch.Tensor) or not isinstance(target_tensor, torch.Tensor):
+            raise ValueError(f"Source HIM checkpoint model weight {key} must be a torch.Tensor.")
+        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+            shape_mismatches.append(f"{key}: source{tuple(source_tensor.shape)} != target{tuple(target_tensor.shape)}")
+    if shape_mismatches:
+        raise ValueError("Source HIM checkpoint model_state_dict has shape mismatches: " + "; ".join(shape_mismatches))
+
+
 def replace_encoder0(source_state_dict, algo_state_dict):
     print("\033[1;36m Replacing encoder.0 weights with untrained weights and avoid critic_encoder.0 \033[0m")
     new_model_state_dict = OrderedDict()
@@ -92,7 +164,7 @@ def reinitialize_actor_critic_backbone(source_state_dict, algo_state_dict):
             or "memory_c" in key
             or "std" in key
         ):
-            if not key in source_state_dict["model_state_dict"]:
+            if key not in source_state_dict["model_state_dict"]:
                 print(
                     "key:",
                     key,
