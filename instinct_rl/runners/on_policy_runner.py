@@ -70,7 +70,11 @@ class OnPolicyRunner:
         ).to(self.device)
 
         alg_class_name = self.alg_cfg.pop("class_name")
-        alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algorithms, alg_class_name)
+        if ":" in alg_class_name:
+            module_name, class_name = alg_class_name.split(":")
+            alg_class = getattr(importlib.import_module(module_name), class_name)
+        else:
+            alg_class = getattr(algorithms, alg_class_name)
         self.alg: algorithms.PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -219,12 +223,27 @@ class OnPolicyRunner:
             if obs_group_name == "policy":
                 obs = normalizer(obs)
                 infos["observations"]["policy"] = obs
+                if "terminal_observations" in infos and obs_group_name in infos["terminal_observations"]:
+                    infos["terminal_observations"][obs_group_name] = self._normalize_without_update(
+                        normalizer,
+                        infos["terminal_observations"][obs_group_name]
+                    )
             elif obs_group_name == "critic":
                 # Doesn't need to worry about `critic is None`. Otherwise, error shall occur when normalizers are being built
                 critic_obs = normalizer(critic_obs)
                 infos["observations"]["critic"] = critic_obs
+                if "terminal_observations" in infos and obs_group_name in infos["terminal_observations"]:
+                    infos["terminal_observations"][obs_group_name] = self._normalize_without_update(
+                        normalizer,
+                        infos["terminal_observations"][obs_group_name]
+                    )
             else:
                 infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
+                if "terminal_observations" in infos and obs_group_name in infos["terminal_observations"]:
+                    infos["terminal_observations"][obs_group_name] = self._normalize_without_update(
+                        normalizer,
+                        infos["terminal_observations"][obs_group_name]
+                    )
         self.alg.process_env_step(rewards, dones, infos, obs, critic_obs)
         return obs, critic_obs, rewards, dones, infos
 
@@ -503,6 +522,13 @@ class OnPolicyRunner:
     def is_mp_rank_other_process(self):
         """Check if current process is in torch distributed multi-processing and not rank 0, or single process."""
         return dist.is_initialized() and dist.get_rank() != 0
+
+    def _normalize_without_update(self, normalizer, observations):
+        was_training = normalizer.training
+        normalizer.eval()
+        normalized = normalizer(observations)
+        normalizer.train(was_training)
+        return normalized
 
     def gather_stat_values(self, values: torch.Tensor, gather_op: str = "mean", remove_nan: bool = True):
         """Properly gather the value across all processes. summarize the input values directly if not in multi-processing.

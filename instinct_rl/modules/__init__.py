@@ -11,6 +11,8 @@ from .all_mixer import (
 )
 from .discriminator import Discriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent
+from .him_actor_critic import HIMActorCritic
+from .him_estimator import HIMEstimator
 from .moe_actor_critic import MoEActorCritic
 from .normalizer import (
     EmpiricalDiscountedVariationNormalization,

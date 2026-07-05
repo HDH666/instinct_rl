@@ -223,6 +223,8 @@ def get_activation(act_name):
         return nn.ReLU()
     elif act_name == "crelu":
         return nn.ReLU()
+    elif act_name == "silu":
+        return nn.SiLU()
     elif act_name == "lrelu":
         return nn.LeakyReLU()
     elif act_name == "tanh":

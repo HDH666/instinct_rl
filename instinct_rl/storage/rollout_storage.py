@@ -608,3 +608,48 @@ class SarsaRolloutStorage(RolloutStorage):
             next_obs_batch,
             next_critic_obs_batch,
         )
+
+
+class HIMRolloutStorage(RolloutStorage):
+    class Transition(RolloutStorage.Transition):
+        def __init__(self):
+            super().__init__()
+            self.next_critic_observations = None
+
+    MiniBatch = namedtuple(
+        "MiniBatch",
+        [
+            *RolloutStorage.MiniBatch._fields,
+            "next_critic_obs",
+        ],
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.critic_observations is not None:
+            self.next_critic_observations = torch.zeros_like(self.critic_observations)
+        else:
+            self.next_critic_observations = torch.zeros_like(self.observations)
+        self.next_privileged_observations = self.next_critic_observations
+
+    def add_transitions(self, transition: Transition):
+        self.next_critic_observations[self.step].copy_(transition.next_critic_observations)
+        return super().add_transitions(transition)
+
+    def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        self._padded_next_critic_obs_trajectories, _ = split_and_pad_trajectories(
+            self.next_critic_observations,
+            self.dones,
+        )
+        return super().recurrent_mini_batch_generator(num_mini_batches, num_epochs)
+
+    def get_minibatch_from_selection(self, T_select, B_select, padded_B_slice=None, prev_done_mask=None):
+        minibatch = super().get_minibatch_from_selection(T_select, B_select, padded_B_slice, prev_done_mask)
+        if padded_B_slice is None:
+            next_critic_obs_batch = self.next_critic_observations[T_select, B_select]
+        else:
+            next_critic_obs_batch = self._padded_next_critic_obs_trajectories[T_select, padded_B_slice]
+        return HIMRolloutStorage.MiniBatch(
+            *minibatch,
+            next_critic_obs_batch,
+        )

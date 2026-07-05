@@ -29,6 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from .estimator import EstimatorPPO, EstimatorTPPO
+from .him_ppo import HIMPPO
 from .lipschitz import LipschitzPPO
 from .ppo import PPO
 from .tppo import TPPO
@@ -49,6 +50,7 @@ __all__ = [
     "TPPO",
     "EstimatorPPO",
     "EstimatorTPPO",
+    "HIMPPO",
     "LipschitzPPO",
     "VaeDistill",
     "WasabiPPO",
