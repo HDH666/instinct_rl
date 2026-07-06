@@ -11,32 +11,86 @@ Returns:
 """
 
 from collections import OrderedDict
+from pathlib import Path
 from typing import Literal
 
 import regex as re
 import torch
 
+_BIGDOG260119_SOURCE_JOINT_NAMES = (
+    "FL_hip_joint",
+    "FL_thigh_joint",
+    "FL_calf_joint",
+    "FR_hip_joint",
+    "FR_thigh_joint",
+    "FR_calf_joint",
+    "BL_hip_joint",
+    "BL_thigh_joint",
+    "BL_calf_joint",
+    "BR_hip_joint",
+    "BR_thigh_joint",
+    "BR_calf_joint",
+)
 
-def strict_him_source_checkpoint(source_state_dict: dict, algo_state_dict: dict):
-    """Adapt a source HIM checkpoint only when model weights match exactly.
+_BIGDOG260119_MJCF_JOINT_NAMES = (
+    "FR_hip_joint",
+    "FR_thigh_joint",
+    "FR_calf_joint",
+    "FL_hip_joint",
+    "FL_thigh_joint",
+    "FL_calf_joint",
+    "BR_hip_joint",
+    "BR_thigh_joint",
+    "BR_calf_joint",
+    "BL_hip_joint",
+    "BL_thigh_joint",
+    "BL_calf_joint",
+)
+
+
+def bigdog260119_source_to_mjcf_action_permutation() -> list[int]:
+    """Indices that reorder a source Bigdog260119 action vector into MJCF order."""
+    return [_BIGDOG260119_SOURCE_JOINT_NAMES.index(name) for name in _BIGDOG260119_MJCF_JOINT_NAMES]
+
+
+def bigdog260119_source_to_mjcf_policy_frame_permutation() -> list[int]:
+    """Indices that reorder one source Bigdog260119 45-D policy frame into MJCF order."""
+    joint_permutation = bigdog260119_source_to_mjcf_action_permutation()
+    return (
+        list(range(9))
+        + [9 + index for index in joint_permutation]
+        + [21 + index for index in joint_permutation]
+        + [33 + index for index in joint_permutation]
+    )
+
+
+def _bigdog260119_source_to_mjcf_history_permutation() -> list[int]:
+    frame_permutation = bigdog260119_source_to_mjcf_policy_frame_permutation()
+    return [frame * 45 + index for frame in range(6) for index in frame_permutation]
+
+
+def strict_him_source_checkpoint(source_state_dict: dict, algo_state_dict: dict, checkpoint_path: str | None = None):
+    """Adapt a source HIM checkpoint for the target HIM model.
 
     This is intended for checkpoints saved by ``him_parkour``'s
-    ``HIMOnPolicyRunner``. It allows top-level metadata to pass through, but
-    model weights must match the target HIM model by key and tensor shape.
+    ``HIMOnPolicyRunner``. Bigdog260119 source checkpoints were trained with
+    Isaac Gym URDF DOF order; the target task keeps MJCF order for new training,
+    so source checkpoints need an explicit input/output weight permutation.
     """
     _require_top_level_key(source_state_dict, "model_state_dict")
     _require_top_level_key(source_state_dict, "iter")
     _require_top_level_key(source_state_dict, "infos")
     _require_top_level_key(algo_state_dict, "model_state_dict")
 
-    if "optimizer_state_dict" in algo_state_dict:
-        _require_optimizer_state_dict(source_state_dict, "optimizer_state_dict")
-    if "estimator_optimizer_state_dict" in algo_state_dict:
-        _require_optimizer_state_dict(source_state_dict, "estimator_optimizer_state_dict")
-
     source_model_state_dict = source_state_dict["model_state_dict"]
     target_model_state_dict = algo_state_dict["model_state_dict"]
     _validate_matching_model_state_dict(source_model_state_dict, target_model_state_dict)
+
+    source_model_state_dict = _adapt_bigdog260119_source_model_state_dict(
+        source_state_dict,
+        source_model_state_dict,
+        checkpoint_path=checkpoint_path,
+    )
 
     adapted_state_dict = OrderedDict()
     for key, value in source_state_dict.items():
@@ -44,9 +98,118 @@ def strict_him_source_checkpoint(source_state_dict: dict, algo_state_dict: dict)
             adapted_state_dict[key] = OrderedDict(
                 (model_key, source_model_state_dict[model_key]) for model_key in target_model_state_dict.keys()
             )
+        elif key.endswith("_normalizer_state_dict"):
+            adapted_state_dict[key] = _adapt_bigdog260119_source_normalizer_state_dict(
+                source_state_dict,
+                key,
+                value,
+                checkpoint_path=checkpoint_path,
+            )
+        elif key in {"optimizer_state_dict", "estimator_optimizer_state_dict"}:
+            continue
         else:
             adapted_state_dict[key] = value
     return adapted_state_dict
+
+
+def _is_old_checkpoint_path(checkpoint_path: str | None) -> bool:
+    return checkpoint_path is not None and "old" in Path(checkpoint_path).name.lower()
+
+
+def _is_bigdog260119_him_source_checkpoint(
+    source_state_dict: dict,
+    model_state_dict: dict | None = None,
+    checkpoint_path: str | None = None,
+) -> bool:
+    del source_state_dict
+    if not _is_old_checkpoint_path(checkpoint_path):
+        return False
+    if model_state_dict is None:
+        return True
+    required_shapes = {
+        "actor.0.weight": (512, 64),
+        "actor.6.weight": (12, 128),
+        "critic.0.weight": (512, 238),
+        "estimator.encoder.0.weight": (128, 270),
+        "estimator.target.0.weight": (128, 45),
+        "std": (12,),
+    }
+    return all(
+        key in model_state_dict and tuple(model_state_dict[key].shape) == shape
+        for key, shape in required_shapes.items()
+    )
+
+
+def _adapt_bigdog260119_source_model_state_dict(
+    source_state_dict: dict,
+    model_state_dict: dict,
+    checkpoint_path: str | None,
+):
+    if not _is_bigdog260119_him_source_checkpoint(source_state_dict, model_state_dict, checkpoint_path):
+        return model_state_dict
+
+    adapted = OrderedDict(
+        (key, value.clone() if isinstance(value, torch.Tensor) else value)
+        for key, value in model_state_dict.items()
+    )
+    frame_permutation = torch.tensor(bigdog260119_source_to_mjcf_policy_frame_permutation(), dtype=torch.long)
+    history_permutation = torch.tensor(_bigdog260119_source_to_mjcf_history_permutation(), dtype=torch.long)
+    action_permutation = torch.tensor(bigdog260119_source_to_mjcf_action_permutation(), dtype=torch.long)
+
+    _permute_weight_columns(adapted, "actor.0.weight", frame_permutation, end=45)
+    _permute_weight_columns(adapted, "critic.0.weight", frame_permutation, end=45)
+    _permute_weight_columns(adapted, "estimator.encoder.0.weight", history_permutation, end=270)
+    _permute_weight_columns(adapted, "estimator.target.0.weight", frame_permutation, end=45)
+
+    _permute_output_rows(adapted, "actor.6.weight", action_permutation)
+    _permute_output_rows(adapted, "actor.6.bias", action_permutation)
+    _permute_output_rows(adapted, "std", action_permutation)
+    return adapted
+
+
+def _permute_weight_columns(state_dict: OrderedDict, key: str, permutation: torch.Tensor, end: int):
+    if key not in state_dict:
+        raise ValueError(f"Source HIM checkpoint is missing Bigdog260119 adapter weight: {key}")
+    weight = state_dict[key]
+    if weight.shape[1] < end:
+        raise ValueError(f"Source HIM checkpoint weight {key} has too few input columns: {tuple(weight.shape)}")
+    permutation = permutation.to(device=weight.device)
+    weight[:, :end] = weight[:, permutation]
+
+
+def _permute_output_rows(state_dict: OrderedDict, key: str, permutation: torch.Tensor):
+    if key not in state_dict:
+        raise ValueError(f"Source HIM checkpoint is missing Bigdog260119 adapter weight: {key}")
+    tensor = state_dict[key]
+    if tensor.shape[0] != len(permutation):
+        raise ValueError(f"Source HIM checkpoint weight {key} has unexpected output shape: {tuple(tensor.shape)}")
+    permutation = permutation.to(device=tensor.device)
+    state_dict[key] = tensor[permutation]
+
+
+def _adapt_bigdog260119_source_normalizer_state_dict(
+    source_state_dict: dict,
+    key: str,
+    normalizer_state_dict: dict,
+    checkpoint_path: str | None,
+):
+    if not _is_bigdog260119_him_source_checkpoint(source_state_dict, checkpoint_path=checkpoint_path):
+        return normalizer_state_dict
+    if key == "policy_normalizer_state_dict":
+        permutation = torch.tensor(_bigdog260119_source_to_mjcf_history_permutation(), dtype=torch.long)
+    elif key == "critic_normalizer_state_dict":
+        frame_permutation = bigdog260119_source_to_mjcf_policy_frame_permutation()
+        permutation = torch.tensor(frame_permutation + list(range(45, 238)), dtype=torch.long)
+    else:
+        return normalizer_state_dict
+
+    adapted = OrderedDict()
+    for stat_key, value in normalizer_state_dict.items():
+        if isinstance(value, torch.Tensor) and value.ndim == 2 and value.shape[1] == len(permutation):
+            adapted[stat_key] = value[:, permutation.to(device=value.device)]
+        else:
+            adapted[stat_key] = value
+    return adapted
 
 
 def _require_top_level_key(state_dict: dict, key: str):

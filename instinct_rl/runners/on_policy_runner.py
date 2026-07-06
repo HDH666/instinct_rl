@@ -29,6 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import importlib
+import inspect
 import os
 import statistics
 import time
@@ -463,10 +464,13 @@ class OnPolicyRunner:
                 ckpt_manipulator_func = getattr(ckpt_manipulator_module, self.cfg["ckpt_manipulator"].split(":")[1])
             else:
                 ckpt_manipulator_func = getattr(ckpt_manipulator, self.cfg["ckpt_manipulator"])
+            ckpt_manipulator_kwargs = dict(self.cfg.get("ckpt_manipulator_kwargs", {}))
+            if "checkpoint_path" in inspect.signature(ckpt_manipulator_func).parameters:
+                ckpt_manipulator_kwargs["checkpoint_path"] = path
             loaded_dict = ckpt_manipulator_func(
                 loaded_dict,
                 self.alg.state_dict(),
-                **self.cfg.get("ckpt_manipulator_kwargs", {}),
+                **ckpt_manipulator_kwargs,
             )
             print("\033[1;36m Done: using a hacky way to load the model. \033[0m")
 

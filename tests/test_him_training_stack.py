@@ -6,6 +6,12 @@ import torch
 from instinct_rl.env import VecEnv
 from instinct_rl.runners.on_policy_runner import OnPolicyRunner
 from instinct_rl.storage import HIMRolloutStorage
+from instinct_rl.utils.ckpt_manipulator import (
+    _bigdog260119_source_to_mjcf_history_permutation,
+    bigdog260119_source_to_mjcf_action_permutation,
+    bigdog260119_source_to_mjcf_policy_frame_permutation,
+    strict_him_source_checkpoint,
+)
 
 
 class MockHIMVecEnv(VecEnv):
@@ -182,6 +188,188 @@ def test_him_source_checkpoint_adapter_loads_exact_model_weights(tmp_path):
         assert torch.equal(loaded_model_state_dict[key], source_weight)
 
 
+def test_bigdog260119_source_checkpoint_adapter_reorders_source_weights_to_mjcf_order():
+    def matrix(rows: int, cols: int) -> torch.Tensor:
+        return torch.arange(rows * cols, dtype=torch.float32).reshape(rows, cols)
+
+    source_model_state_dict = OrderedDict(
+        {
+            "actor.0.weight": matrix(512, 64),
+            "actor.6.weight": matrix(12, 128),
+            "actor.6.bias": torch.arange(12, dtype=torch.float32),
+            "critic.0.weight": matrix(512, 238),
+            "estimator.encoder.0.weight": matrix(128, 270),
+            "estimator.target.0.weight": matrix(128, 45),
+            "std": torch.arange(12, dtype=torch.float32) + 0.5,
+        }
+    )
+    source_state_dict = {
+        "model_state_dict": source_model_state_dict,
+        "policy_normalizer_state_dict": {
+            "_mean": matrix(1, 270),
+            "_var": matrix(1, 270) + 1.0,
+            "_std": matrix(1, 270) + 2.0,
+            "count": torch.tensor(42),
+        },
+        "critic_normalizer_state_dict": {
+            "_mean": matrix(1, 238),
+            "_var": matrix(1, 238) + 1.0,
+            "_std": matrix(1, 238) + 2.0,
+            "count": torch.tensor(42),
+        },
+        "iter": 17,
+        "infos": {"source": "him_parkour"},
+    }
+    algo_state_dict = {
+        "model_state_dict": OrderedDict(
+            (key, torch.zeros_like(value)) for key, value in source_model_state_dict.items()
+        )
+    }
+
+    adapted = strict_him_source_checkpoint(
+        source_state_dict,
+        algo_state_dict,
+        checkpoint_path="/tmp/model_old_90300.pt",
+    )
+
+    frame_perm = bigdog260119_source_to_mjcf_policy_frame_permutation()
+    history_perm = _bigdog260119_source_to_mjcf_history_permutation()
+    action_perm = bigdog260119_source_to_mjcf_action_permutation()
+
+    model = adapted["model_state_dict"]
+    assert torch.equal(
+        model["actor.0.weight"][:, :45],
+        source_model_state_dict["actor.0.weight"][:, frame_perm],
+    )
+    assert torch.equal(
+        model["critic.0.weight"][:, :45],
+        source_model_state_dict["critic.0.weight"][:, frame_perm],
+    )
+    assert torch.equal(
+        model["estimator.encoder.0.weight"][:, :270],
+        source_model_state_dict["estimator.encoder.0.weight"][:, history_perm],
+    )
+    assert torch.equal(
+        model["estimator.target.0.weight"][:, :45],
+        source_model_state_dict["estimator.target.0.weight"][:, frame_perm],
+    )
+    assert torch.equal(model["actor.6.weight"], source_model_state_dict["actor.6.weight"][action_perm])
+    assert torch.equal(model["actor.6.bias"], source_model_state_dict["actor.6.bias"][action_perm])
+    assert torch.equal(model["std"], source_model_state_dict["std"][action_perm])
+    assert torch.equal(
+        adapted["policy_normalizer_state_dict"]["_mean"],
+        source_state_dict["policy_normalizer_state_dict"]["_mean"][:, history_perm],
+    )
+    assert torch.equal(
+        adapted["critic_normalizer_state_dict"]["_mean"][:, :45],
+        source_state_dict["critic_normalizer_state_dict"]["_mean"][:, frame_perm],
+    )
+    assert torch.equal(
+        adapted["critic_normalizer_state_dict"]["_mean"][:, 45:],
+        source_state_dict["critic_normalizer_state_dict"]["_mean"][:, 45:],
+    )
+
+
+def test_bigdog260119_source_checkpoint_adapter_treats_old_filename_as_source_checkpoint():
+    def matrix(rows: int, cols: int) -> torch.Tensor:
+        return torch.arange(rows * cols, dtype=torch.float32).reshape(rows, cols)
+
+    source_model_state_dict = OrderedDict(
+        {
+            "actor.0.weight": matrix(512, 64),
+            "actor.6.weight": matrix(12, 128),
+            "actor.6.bias": torch.arange(12, dtype=torch.float32),
+            "critic.0.weight": matrix(512, 238),
+            "estimator.encoder.0.weight": matrix(128, 270),
+            "estimator.target.0.weight": matrix(128, 45),
+            "std": torch.arange(12, dtype=torch.float32),
+        }
+    )
+    source_state_dict = {
+        "model_state_dict": source_model_state_dict,
+        "iter": 90300,
+        "infos": None,
+    }
+    algo_state_dict = {
+        "model_state_dict": OrderedDict(
+            (key, torch.zeros_like(value)) for key, value in source_model_state_dict.items()
+        )
+    }
+
+    adapted = strict_him_source_checkpoint(
+        source_state_dict,
+        algo_state_dict,
+        checkpoint_path="/tmp/model_old_90300.pt",
+    )
+
+    action_perm = bigdog260119_source_to_mjcf_action_permutation()
+    assert torch.equal(adapted["model_state_dict"]["std"], source_model_state_dict["std"][action_perm])
+
+
+def test_bigdog260119_source_checkpoint_adapter_ignores_infos_without_old_filename():
+    source_model_state_dict = OrderedDict(
+        {
+            "actor.0.weight": torch.arange(512 * 64, dtype=torch.float32).reshape(512, 64),
+            "actor.6.weight": torch.arange(12 * 128, dtype=torch.float32).reshape(12, 128),
+            "actor.6.bias": torch.arange(12, dtype=torch.float32),
+            "critic.0.weight": torch.arange(512 * 238, dtype=torch.float32).reshape(512, 238),
+            "estimator.encoder.0.weight": torch.arange(128 * 270, dtype=torch.float32).reshape(128, 270),
+            "estimator.target.0.weight": torch.arange(128 * 45, dtype=torch.float32).reshape(128, 45),
+            "std": torch.arange(12, dtype=torch.float32),
+        }
+    )
+    source_state_dict = {
+        "model_state_dict": source_model_state_dict,
+        "iter": 17,
+        "infos": {"source": "him_parkour"},
+    }
+    algo_state_dict = {
+        "model_state_dict": OrderedDict(
+            (key, torch.zeros_like(value)) for key, value in source_model_state_dict.items()
+        )
+    }
+
+    adapted = strict_him_source_checkpoint(
+        source_state_dict,
+        algo_state_dict,
+        checkpoint_path="/tmp/model_90300.pt",
+    )
+
+    assert torch.equal(adapted["model_state_dict"]["std"], source_model_state_dict["std"])
+
+
+def test_bigdog260119_source_checkpoint_adapter_ignores_old_directory_name():
+    source_model_state_dict = OrderedDict(
+        {
+            "actor.0.weight": torch.arange(512 * 64, dtype=torch.float32).reshape(512, 64),
+            "actor.6.weight": torch.arange(12 * 128, dtype=torch.float32).reshape(12, 128),
+            "actor.6.bias": torch.arange(12, dtype=torch.float32),
+            "critic.0.weight": torch.arange(512 * 238, dtype=torch.float32).reshape(512, 238),
+            "estimator.encoder.0.weight": torch.arange(128 * 270, dtype=torch.float32).reshape(128, 270),
+            "estimator.target.0.weight": torch.arange(128 * 45, dtype=torch.float32).reshape(128, 45),
+            "std": torch.arange(12, dtype=torch.float32),
+        }
+    )
+    source_state_dict = {
+        "model_state_dict": source_model_state_dict,
+        "iter": 17,
+        "infos": None,
+    }
+    algo_state_dict = {
+        "model_state_dict": OrderedDict(
+            (key, torch.zeros_like(value)) for key, value in source_model_state_dict.items()
+        )
+    }
+
+    adapted = strict_him_source_checkpoint(
+        source_state_dict,
+        algo_state_dict,
+        checkpoint_path="/tmp/old/model_90300.pt",
+    )
+
+    assert torch.equal(adapted["model_state_dict"]["std"], source_model_state_dict["std"])
+
+
 @pytest.mark.parametrize(
     ("mutate_checkpoint", "match"),
     [
@@ -202,10 +390,6 @@ def test_him_source_checkpoint_adapter_loads_exact_model_weights(tmp_path):
                 torch.zeros(1),
             ),
             "shape mismatches",
-        ),
-        (
-            lambda checkpoint: checkpoint.pop("estimator_optimizer_state_dict"),
-            "estimator_optimizer_state_dict",
         ),
     ],
 )
